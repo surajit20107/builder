@@ -1213,6 +1213,18 @@ async function deleteChat(chatId) {
                 undeleted.push(label);
             }
         };
+        // The user-visible half of an unfinished delete. Keeps the entry listed
+        // (it is what carries the site/worker references a retry needs), lifts
+        // the tombstone so the project stays editable, and says what survived.
+        const abortPartialDelete = async () => {
+            _deletedChatIds.delete(chatId);
+            updateChatHistorySidebar();
+            const what = undeleted.slice(0, 3).join(', ') + (undeleted.length > 3 ? ', and more' : '');
+            await puter.ui.alert(`Couldn't finish deleting “${chat?.title || 'this project'}”: ${what} could not be removed. The project is still listed — try deleting it again in a moment.`);
+            const err = new Error('Delete incomplete: ' + undeleted.join(', '));
+            err.partialDelete = true;
+            throw err;
+        };
 
         // Remove the hosted sites if any exist — both the draft (previewUrl) and,
         // separately, the published public subdomain (publishedUrl). They're
@@ -1259,10 +1271,30 @@ async function deleteChat(chatId) {
         // Remove the published copy (the separate dir the public subdomain served)
         await cleanup('the published copy', () => puter.fs.delete(publishedDir, { recursive: true }));
 
-        // Remove the project's version-history snapshots and its issues list.
-        // Both are private storage behind their own best-effort deletes: a
-        // leftover costs space, never a live endpoint, so neither blocks the
-        // deletion the way a site, a worker or the project's own files do.
+        // ---- Phase 1: the project's live surface -----------------------------
+        // The hosted sites, the workers and the project's own files are now all
+        // gone (or accounted for). If any of them survived, the delete did not
+        // happen: stop here, with the entry, the conversation, the version
+        // history and the issues all intact, so the user can still reach
+        // everything and a retry has something left to finish.
+        if (undeleted.length) await abortPartialDelete();
+
+        // ---- Phase 2: committed — the project leaves the sidebar --------------
+        // The entry is the last handle on the private history below, so it is
+        // only destroyed once the delete is certain.
+        //
+        // These used to run in phase 1, which made an unfinished delete quietly
+        // take the project's restore points, issue list and conversation with
+        // it: one failed `hosting.delete` — the first and most failure-prone
+        // step — left the entry listed and re-deletable, but with no version
+        // history behind it and no conversation file, so opening the project
+        // failed at loadChat with "Couldn't open the project". The user was told
+        // to try again; the retry had nothing left to lose.
+        //
+        // Versions and issues stay best-effort — a leftover costs space, never a
+        // live endpoint. The conversation file is still recorded as a failure,
+        // because dropping it after the entry is gone would let a later index
+        // rebuild resurrect the project (see recoverChatListFromFiles).
         try { await window.deleteChatVersions?.(chatId); }
         catch (e) { console.warn('Version snapshots already deleted or not found:', e); }
         try { await window.deleteChatIssues?.(chatId); }
@@ -1271,18 +1303,7 @@ async function deleteChat(chatId) {
         // Remove chat history file
         await cleanup('the saved conversation', () => puter.fs.delete(`chat-history/${chatId}.json`));
 
-        if (undeleted.length) {
-            // Keep the project visible and deletable: its entry is what carries
-            // the site and worker references a retry needs. Lifting the
-            // tombstone re-allows saves for it, which is right — it still exists.
-            _deletedChatIds.delete(chatId);
-            updateChatHistorySidebar();
-            const what = undeleted.slice(0, 3).join(', ') + (undeleted.length > 3 ? ', and more' : '');
-            await puter.ui.alert(`Couldn't finish deleting “${chat?.title || 'this project'}”: ${what} could not be removed. The project is still listed — try deleting it again in a moment.`);
-            const err = new Error('Delete incomplete: ' + undeleted.join(', '));
-            err.partialDelete = true;
-            throw err;
-        }
+        if (undeleted.length) await abortPartialDelete();
 
         // The delete succeeded — animate the sidebar entry out before anything
         // below re-renders the list (updateChatHistorySidebar here, and
